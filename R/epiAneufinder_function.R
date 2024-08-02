@@ -139,9 +139,10 @@ epiAneufinder <- function(input, outdir, blacklist, windowSize, genome="BSgenome
 #    corrected_counts <- readRDS(file.path(outdir,"counts_gc_corrected.rds"))
 #          
 #  }
+    
   if(!file.exists(file.path(outdir,"counts_gc_corrected.rds"))) {
     message("Correcting for GC bias...")
-    summarizedCounts <- rowSums(peaks[, grepl("cell-", colnames(peaks)), with = FALSE])
+    summarizedCounts <- matrixStats::rowMedians(as.matrix(peaks[, grepl("cell-", colnames(peaks)), with = FALSE]))
     fit <- stats::loess(summarizedCounts ~ peaks$GC)
     corrected_counts <- peaks[, mclapply(.SD, function(x) {
       # LOESS correction for GC
