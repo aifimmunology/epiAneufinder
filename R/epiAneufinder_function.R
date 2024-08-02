@@ -89,6 +89,9 @@ epiAneufinder <- function(input, outdir, blacklist, windowSize, genome="BSgenome
         stop("Please provide a fragments .tsv/.bed or a path to the directory containing all the bam files")
       }
       counts <- generateCountMatrix(fragments, windows, by="barcode", minFrags = minFrags)
+    }else{
+    
+        stop('No counts detected')
     }
     
     #Check that the count matrix really has entries
@@ -99,19 +102,51 @@ epiAneufinder <- function(input, outdir, blacklist, windowSize, genome="BSgenome
     print(paste("Count matrix with",ncol(counts),"cells and",nrow(counts),"windows",
                 "has been generated and will be saved as count_summary.rds"))
     saveRDS(counts, file.path(outdir,"count_summary.rds"))
+  }else{
+  
+    counts <- readRDS(file.path(outdir,"count_summary.rds"))
   }
 
-  counts <- readRDS(file.path(outdir,"count_summary.rds"))
+  
   peaks <- as.data.table(assays(counts)$counts)
   colnames(peaks) <- paste0('cell-', colnames(peaks))
   rowinfo <- as.data.table(rowRanges(counts))
   peaks <- cbind(rowinfo, peaks)
 
+  ## Make your cluster for parallelization   
+  #cl <- parallel::makeCluster(ncores)
+    
+#  if(!file.exists(file.path(outdir,"counts_gc_corrected.rds"))) {
+#    message("Correcting for GC bias...")
+#   
+#    ## Generate list for efficient parallelization. 
+#    iterList= lapply(grep('cell-', colnames(peaks), value = TRUE), function(x){
+#            peaks[,c('GC', ..x)]
+#        })
+#    
+#    ## Correct for GC content
+#    corrected_countsList = do.call('cbind', pbapply::pblapply(cl = cl, 
+#                                            iterList, correctCounts))
+#    colnames(corrected_countsList) = grep('cell-', colnames(peaks), value = TRUE)
+#      
+#    ## Bind GC correction back in with peak info. 
+#    corrected_counts = cbind(peaks[, c(1:12)], corrected_countsList)
+#        parallel::stopCluster(cl)
+#    saveRDS(corrected_counts, file.path(outdir,"counts_gc_corrected.rds"))
+#      
+#  }else{
+#      
+#    corrected_counts <- readRDS(file.path(outdir,"counts_gc_corrected.rds"))
+#          
+#  }
+    browser()
   if(!file.exists(file.path(outdir,"counts_gc_corrected.rds"))) {
     message("Correcting for GC bias...")
+    summarizedCounts <- rowSums(peaks[, grepl("cell-", colnames(peaks)), with = FALSE])
+    fit <- stats::loess(summarizedCounts ~ peaks$GC)
     corrected_counts <- peaks[, mclapply(.SD, function(x) {
       # LOESS correction for GC
-      fit <- stats::loess(x ~ peaks$GC)
+      #fit <- stats::loess(x ~ peaks$GC)
       correction <- mean(x) / fit$fitted
       as.integer(round(x * correction))
     }, mc.cores = ncores), .SDcols = patterns("cell-")]
@@ -129,24 +164,30 @@ epiAneufinder <- function(input, outdir, blacklist, windowSize, genome="BSgenome
   peaks$seqnames<-droplevels(peaks$seqnames)
   
   print(paste("Filtering empty windows,",nrow(peaks),"windows remain."))
-  
+    
   if(!file.exists(file.path(outdir,"results_gc_corrected.rds"))) {
     
+    print("Calculating distance AD")
     clusters_ad <- peaks[, mclapply(.SD, function(x) {
-      peaksperchrom <- split(x, peaks$seqnames)
-      print("Calculating distance AD")
+      peaksperchrom <- split(x, peaks$seqnames) 
       results <- lapply(peaksperchrom, function(x2) {
         getbp(x2, k = k, minsize = minsize, test=test,minsizeCNV=minsizeCNV)
       })
     }, mc.cores = ncores), .SDcols = patterns("cell-")]
     saveRDS(clusters_ad, file.path(outdir, "results_gc_corrected.rds"))
+      
+  }else{
+    
+    ## If file exists, then load it in. 
+    clusters_ad <- readRDS(file.path(outdir,"results_gc_corrected.rds"))
+      
   }
+    
   print("Successfully identified breakpoints")
 
   if(!file.exists(file.path(outdir,"cnv_calls.rds"))) {
     names_seq <- levels(peaks$seqnames)
-
-    clusters_ad <- readRDS(file.path(outdir,"results_gc_corrected.rds"))
+    
     breakpoints <- lapply(clusters_ad, function(x) { lapply(x,'[[', 1) })
     distances <- lapply(clusters_ad, function(x) { lapply(x,'[[', 2) })
     # Combine the braekpoints and distances in one dataframe
@@ -200,6 +241,7 @@ epiAneufinder <- function(input, outdir, blacklist, windowSize, genome="BSgenome
     print("Successfully assigned gain-loss")
     saveRDS(somies_ad, file.path(outdir, "cnv_calls.rds"))
   }
+
   
   somies_ad <- readRDS(file.path(outdir,"cnv_calls.rds"))
   # Write the results to disk
@@ -222,4 +264,46 @@ epiAneufinder <- function(input, outdir, blacklist, windowSize, genome="BSgenome
     plot_karyo_gainloss(somies_ad = somies_ad, outdir = outdir, peaks = peaks, uq, lq, title_karyo)
     print("Successfully plotted karyogram")
   }
+}
+
+
+#' Function for efficient parallelization of count correction
+#'
+#' @param peakList One index of a list with the first index being the raw counts, and the second being the GC content for those regions. 
+#' @import stats
+#' @return \code{NULL}
+#' @author MP Pebworth
+#' @noRd
+
+correctCounts <- function(peakList){
+     
+     colnames(peakList) = c('GC', 'Cell')
+     #fit <- stats::loess(Cell ~ GC, peakList)
+     fit <- limma::loessFit(peakList$Cell, peakList$GC, method = 'loess')
+     correction <- mean(unlist(peakList[,2])) / fit$fitted
+     correction[is.na(correction)] = 0
+     result <- as.integer(round(unlist(peakList[,2]) * correction))
+     rm(fit)
+     rm(correction)
+     return(result)
+}
+
+#' Function for efficient parallelization of count correction
+#'
+#' @param peakList2 One index of a list with the first index being the a data.table of seqnames and counts, second index is k, 3rd is minsize, then test, and minsizeCNV
+#' @import stats
+#' @return \code{NULL}
+#' @author MP Pebworth
+#' @noRd
+calculateDistance <- function(peakList2){
+    k = peakList2[[2]]
+    minsize= peakList2[[3]]
+    test= peakList2[[4]]
+    minsizeCNV = peakList2[[5]]
+    peaksperchrom <- split(peakList2[[1]][,2], peakList2[[1]][,1])
+      results <- lapply(peaksperchrom, function(x2) {
+        getbp(x2, k = k, minsize = minsize, test=test,minsizeCNV=minsizeCNV)
+      })
+    rm(peaksperchrom)
+    return(results)
 }
